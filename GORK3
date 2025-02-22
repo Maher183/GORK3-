@@ -1,0 +1,296 @@
+import requests
+import json
+import time
+import os
+from datetime import datetime, timedelta
+import pandas as pd
+import tweepy
+from telegram import Bot
+from telegram.ext import Updater, CommandHandler
+from solana.rpc.api import Client
+import sqlite3
+from dotenv import load_dotenv
+from cryptography.fernet import Fernet
+from typing import Dict, List, Optional
+import logging
+
+# إعداد السجل لتتبع الأخطاء
+logging.basicConfig(filename='bot.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# تحميل البيانات الحساسة من ملف .env
+load_dotenv()
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY").encode()
+fernet = Fernet(ENCRYPTION_KEY)
+
+# تشفير وفك تشفير البيانات الحساسة
+def encrypt_data(data: str) -> str:
+    return fernet.encrypt(data.encode()).decode()
+
+def decrypt_data(encrypted_data: str) -> str:
+    return fernet.decrypt(encrypted_data.encode()).decode()
+
+# قراءة وحفظ ملف التكوين
+def load_config(config_file: str = "config.json") -> Dict:
+    with open(config_file, "r") as f:
+        return json.load(f)
+
+def save_config(config: Dict, config_file: str = "config.json"):
+    with open(config_file, "w") as f:
+        json.dump(config, f, indent=4)
+
+# إعداد قاعدة البيانات
+def setup_database():
+    conn = sqlite3.connect("solana_tokens.db", check_same_thread=False)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tokens (
+            token_address TEXT PRIMARY KEY,
+            name TEXT,
+            source TEXT,
+            volume REAL,
+            market_cap REAL,
+            dev_wallet TEXT,
+            created_at TEXT,
+            purchase_amount REAL,
+            slippage REAL,
+            initial_fees REAL,
+            solsniffer_score REAL,
+            fake_volume INTEGER,
+            automated_tx_detected INTEGER,
+            wash_trading_detected INTEGER,
+            rugcheck_status TEXT,
+            tweetscout_score INTEGER,
+            tweetscout_followers TEXT,
+            trust_level TEXT,
+            timestamp TEXT
+        )
+    """)
+    conn.commit()
+    return conn, cursor
+
+solana_client = Client(decrypt_data(os.getenv("SOLANA_RPC_URL")))
+
+# إعداد Telegram Bot
+def setup_telegram_bot():
+    bot = Bot(token=decrypt_data(os.getenv("TELEGRAM_BOT_TOKEN")))
+    updater = Updater(token=decrypt_data(os.getenv("TELEGRAM_BOT_TOKEN")), use_context=True)
+    return bot, updater
+
+# التحقق من Solsniffer
+def check_solsniffer(token_address: str) -> float:
+    api_key = decrypt_data(os.getenv("SOLSNIFIER_API_KEY"))
+    url = f"https://api.solsniffer.com/verify/{token_address}?api_key={api_key}"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return float(response.json().get("score", 0))
+    except Exception as e:
+        logging.error(f"خطأ في Solsniffer لـ {token_address}: {e}")
+        return 0.0
+
+# التحقق من Rugcheck
+def check_rugcheck_xyz(token_address: str) -> Dict:
+    url = f"https://api.rugcheck.xyz/v1/token/{token_address}"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return {"status": data.get("status", "Unknown"), "bundled": data.get("bundled", False)}
+    except Exception as e:
+        logging.error(f"خطأ في Rugcheck لـ {token_address}: {e}")
+        return {"status": "Unknown", "bundled": False}
+
+# التحقق من Tweetscout
+def check_tweetscout(token_handle: str) -> Dict:
+    api_key = decrypt_data(os.getenv("TWEETSCOUT_API_KEY"))
+    url = f"https://api.tweetscout.io/score/{token_handle}?api_key={api_key}"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        score = data.get("score", 0)
+        trust_level = "High" if score > 300 else "Medium" if score > 100 else "Low"
+        return {"score": score, "followers": data.get("significant_followers", []), "trust_level": trust_level}
+    except Exception as e:
+        logging.error(f"خطأ في Tweetscout لـ {token_handle}: {e}")
+        return {"score": 0, "followers": [], "trust_level": "Unknown"}
+
+# الكشف عن السلوكيات المشبوهة
+def detect_suspicious_activity(token: Dict, prev_data: Optional[Dict] = None) -> Dict:
+    volume = float(token.get("volume", {}).get("h24", 0))
+    market_cap = float(token.get("marketCap", 0))
+    price_change = float(token.get("priceChange", {}).get("h24", 0)) if token.get("priceChange") else 0
+    tx_count = token.get("tx_count", 0)
+
+    fake_volume = volume / market_cap > 10 if market_cap > 0 else False
+    automated_tx = tx_count > 1000
+    wash_trading = False
+    if prev_data:
+        prev_volume = float(prev_data.get("volume", {}).get("h24", 0))
+        volume_increase = (volume - prev_volume) / prev_volume if prev_volume > 0 else 0
+        if volume_increase > 3 and abs(price_change) < 5:
+            wash_trading = True
+    return {"fake_volume": fake_volume, "automated_tx": automated_tx, "wash_trading": wash_trading}
+
+# جلب بيانات من Dexscreener
+def fetch_dexscreener_data() -> List[Dict]:
+    url = "https://api.dexscreener.com/latest/dex/tokens/solana"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return response.json().get("pairs", [])
+    except Exception as e:
+        logging.error(f"خطأ في Dexscreener: {e}")
+        return []
+
+# أوامر الشراء والبيع
+def buy_token(bot, chat_id, token_address: str, amount: float, slippage: float, fees: float):
+    command = f"/buy {token_address} {amount} SOL --slippage {slippage} --fees {fees}"
+    bot.send_message(chat_id=chat_id, text=command)
+    logging.info(f"تم إرسال أمر شراء: {command}")
+
+def sell_token(bot, chat_id, token_address: str, percentage: float, take_profit: float, stop_loss: float):
+    command = f"/sell {token_address} {percentage}% --tp {take_profit} --sl {stop_loss}"
+    bot.send_message(chat_id=chat_id, text=command)
+    logging.info(f"تم إرسال أمر بيع: {command}")
+
+# تصفية الرموز
+def filter_tokens(tokens: List[Dict], config: Dict, prev_data: Dict, bot, chat_id) -> List[Dict]:
+    filtered = []
+    now = datetime.now()
+    min_volume = config["filters"]["min_volume"]
+    min_market_cap = config["filters"]["min_market_cap"]
+    max_age_hours = config["filters"]["max_age_hours"]
+    blacklist_tokens = set(config["blacklist_tokens"])
+    blacklist_devs = set(config["blacklist_developers"])
+    purchase_amount = config["trading"]["purchase_amount"]
+    slippage = config["trading"]["slippage"]
+    initial_fees = config["trading"]["initial_fees"]
+
+    for token in tokens:
+        token_address = token.get("address", "N/A")
+        dev_wallet = token.get("dev_wallet", "N/A")
+        twitter_handle = token.get("twitter_handle", "N/A")
+        volume = float(token.get("volume", {}).get("h24", 0))
+        market_cap = float(token.get("marketCap", 0))
+        created_at = token.get("created_at", now.isoformat())
+
+        solsniffer_score = check_solsniffer(token_address)
+        if solsniffer_score < 85:
+            continue
+
+        rugcheck = check_rugcheck_xyz(token_address)
+        if rugcheck["bundled"]:
+            config["blacklist_tokens"].append(token_address)
+            if dev_wallet != "N/A":
+                config["blacklist_developers"].append(dev_wallet)
+            save_config(config)
+            continue
+        if rugcheck["status"] != "Good":
+            continue
+
+        tweetscout = check_tweetscout(twitter_handle) if twitter_handle != "N/A" else {"score": 0, "followers": [], "trust_level": "Unknown"}
+        if tweetscout["trust_level"] != "High":
+            continue
+
+        suspicious_activity = detect_suspicious_activity(token, prev_data.get(token_address))
+        if any(suspicious_activity.values()):
+            continue
+
+        age_hours = (now - datetime.fromisoformat(created_at)).total_seconds() / 3600
+        if (token_address in blacklist_tokens or dev_wallet in blacklist_devs or
+            volume < min_volume or market_cap < min_market_cap or age_hours > max_age_hours):
+            continue
+
+        buy_token(bot, chat_id, token_address, purchase_amount, slippage, initial_fees)
+
+        token["solsniffer_score"] = solsniffer_score
+        token["rugcheck_status"] = rugcheck["status"]
+        token["tweetscout_score"] = tweetscout["score"]
+        token["tweetscout_followers"] = json.dumps(tweetscout["followers"])
+        token["trust_level"] = tweetscout["trust_level"]
+        token["purchase_amount"] = purchase_amount
+        token["slippage"] = slippage
+        token["initial_fees"] = initial_fees
+        token["fake_volume"] = int(suspicious_activity["fake_volume"])
+        token["automated_tx_detected"] = int(suspicious_activity["automated_tx"])
+        token["wash_trading_detected"] = int(suspicious_activity["wash_trading"])
+        filtered.append(token)
+    return filtered
+
+# البيع التلقائي
+def auto_sell(update, context):
+    config = load_config()
+    conn, cursor = setup_database()
+    cursor.execute("SELECT token_address, market_cap FROM tokens")
+    tokens = cursor.fetchall()
+    bot = context.bot
+    chat_id = update.effective_chat.id
+
+    for token_address, market_cap in tokens:
+        try:
+            price = float(requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_address}").json()["pairs"][0]["priceUsd"])
+            take_profit = config["trading"]["take_profit"]
+            stop_loss = config["trading"]["stop_loss"]
+
+            if price >= take_profit or price <= stop_loss:
+                sell_token(bot, chat_id, token_address, 100, take_profit, stop_loss)
+        except Exception as e:
+            logging.error(f"خطأ في البيع التلقائي لـ {token_address}: {e}")
+
+# الدالة الرئيسية
+def main():
+    config = load_config()
+    conn, cursor = setup_database()
+    bot, updater = setup_telegram_bot()
+    dp = updater.dispatcher
+    dp.add_handler(CommandHandler("autosell", auto_sell))
+    updater.start_polling()
+
+    chat_id = decrypt_data(os.getenv("TELEGRAM_CHAT_ID"))
+    prev_data = {}
+
+    while True:
+        try:
+            print(f"جارٍ الجلب في: {datetime.now()}")
+            dexscreener_data = fetch_dexscreener_data()
+            filtered_data = filter_tokens(dexscreener_data, config, prev_data, bot, chat_id)
+
+            for token in filtered_data:
+                token_address = token["address"]
+                df = pd.DataFrame([{
+                    "token_address": token_address,
+                    "name": token.get("name", "Unknown"),
+                    "source": "Dexscreener",
+                    "volume": token.get("volume", {}).get("h24", 0),
+                    "market_cap": token["market_cap"],
+                    "dev_wallet": token["dev_wallet"],
+                    "created_at": token["created_at"],
+                    "purchase_amount": token["purchase_amount"],
+                    "slippage": token["slippage"],
+                    "initial_fees": token["initial_fees"],
+                    "solsniffer_score": token["solsniffer_score"],
+                    "fake_volume": token["fake_volume"],
+                    "automated_tx_detected": token["automated_tx_detected"],
+                    "wash_trading_detected": token["wash_trading_detected"],
+                    "rugcheck_status": token["rugcheck_status"],
+                    "tweetscout_score": token["tweetscout_score"],
+                    "tweetscout_followers": token["tweetscout_followers"],
+                    "trust_level": token["trust_level"],
+                    "timestamp": datetime.now().isoformat()
+                }])
+                for _, row in df.iterrows():
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO tokens VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, tuple(row))
+                conn.commit()
+                prev_data[token_address] = token
+
+            logging.info(f"تم تصفية وحفظ {len(filtered_data)} رمزًا")
+            time.sleep(3600)  # التكرار كل ساعة
+        except Exception as e:
+            logging.error(f"خطأ في الحلقة الرئيسية: {e}")
+            time.sleep(60)  # إعادة المحاولة بعد دقيقة
+
+if __name__ == "__main__":
+    main()
